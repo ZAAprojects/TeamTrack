@@ -114,12 +114,35 @@ function generateId(prefix) {
     );
 }
 
+function parseTeamTrackDate(dateString) {
+    if (!dateString) return null;
+
+    let date = new Date(dateString);
+    if (!isNaN(date.getTime())) return date;
+
+    // Older sheet rows may contain dd/MM/yyyy HH:mm:ss strings.
+    const match = String(dateString).match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
+    if (match) {
+        date = new Date(
+            Number(match[3]),
+            Number(match[2]) - 1,
+            Number(match[1]),
+            Number(match[4] || 0),
+            Number(match[5] || 0),
+            Number(match[6] || 0)
+        );
+        if (!isNaN(date.getTime())) return date;
+    }
+
+    return null;
+}
+
 function formatDate(dateString) {
     if (!dateString) return "—";
 
-    const date = new Date(dateString);
+    const date = parseTeamTrackDate(dateString);
 
-    if (isNaN(date.getTime())) {
+    if (!date || isNaN(date.getTime())) {
         return dateString;
     }
 
@@ -133,9 +156,9 @@ function formatDate(dateString) {
 function formatDateTime(dateString) {
     if (!dateString) return "—";
 
-    const date = new Date(dateString);
+    const date = parseTeamTrackDate(dateString);
 
-    if (isNaN(date.getTime())) {
+    if (!date || isNaN(date.getTime())) {
         return dateString;
     }
 
@@ -189,9 +212,13 @@ function showToast(message) {
 }
 
 
+// Track pending writes so a refresh never overwrites a change still being saved.
+let pendingSheetWrites = 0;
+
 // Send an action to Google Apps Script.
 // text/plain keeps the request a simple cross-origin request (no JSON preflight).
 async function sendToSheet(payload) {
+    pendingSheetWrites++;
     try {
         const response = await fetch(SCRIPT_URL, {
             method: "POST",
@@ -217,6 +244,8 @@ async function sendToSheet(payload) {
         console.error("Google Sheet write error:", error);
         showToast("Could not confirm the Google Sheets update. Please refresh and check.");
         return { success: false, error: error.message };
+    } finally {
+        pendingSheetWrites = Math.max(0, pendingSheetWrites - 1);
     }
 }
 
@@ -270,6 +299,125 @@ async function loadMembers() {
 }
 
 
+
+// Load every shared TeamTrack section from Google Sheets.
+async function loadAllData() {
+    try {
+        const url = `${SCRIPT_URL}?action=getAllData&_=${Date.now()}`;
+        const response = await fetch(url, {
+            method: "GET",
+            cache: "no-store",
+            redirect: "follow"
+        });
+
+        if (!response.ok) {
+            throw new Error(`Google Apps Script returned ${response.status}`);
+        }
+
+        const data = await response.json();
+        if (!data || data.success === false) {
+            throw new Error(data && data.message ? data.message : "Could not read shared TeamTrack data.");
+        }
+
+        if (Array.isArray(data.members)) {
+            teamMembers = [...new Set(data.members
+                .map(member => typeof member === "string" ? member : member.name)
+                .filter(member => typeof member === "string" && member.trim())
+                .map(member => member.trim()))];
+            saveMembers();
+        }
+
+        if (Array.isArray(data.tasks)) {
+            tasks = data.tasks.map(task => ({
+                ...task,
+                progress: Number(task.progress || 0)
+            }));
+            saveTasks();
+        }
+
+        if (Array.isArray(data.logs)) {
+            logs = data.logs;
+            saveLogs();
+        }
+
+        if (Array.isArray(data.reviews)) {
+            reviews = data.reviews.map(review => ({
+                ...review,
+                reviewKey: review.reviewId || getReviewKey(review.logId, review.reviewedBy)
+            }));
+            saveReviews();
+        }
+
+        if (Array.isArray(data.meetings)) {
+            meetings = data.meetings;
+            saveMeetings();
+        }
+
+        if (Array.isArray(data.attendance)) {
+            attendance = data.attendance.map(record => ({
+                ...record,
+                present: record.present === true ||
+                    record.present === 1 ||
+                    String(record.present).toLowerCase() === "true" ||
+                    String(record.present) === "1"
+            }));
+            saveAttendance();
+        }
+
+        if (Array.isArray(data.mom)) {
+            mom = data.mom;
+            saveMOM();
+        }
+
+        populateMemberLogin();
+
+        if (currentUser) {
+            populateAssignee();
+            populateMeetingSelects();
+            renderAll();
+        }
+
+        return true;
+    } catch (error) {
+        console.error("Could not load shared TeamTrack data:", error);
+        // Keep the last saved local cache if the shared spreadsheet is temporarily unavailable.
+        populateMemberLogin();
+        return false;
+    }
+}
+
+let sharedSyncTimer = null;
+let isRefreshingSharedData = false;
+
+async function refreshSharedData() {
+    if (!currentUser || isRefreshingSharedData || pendingSheetWrites > 0) return;
+
+    isRefreshingSharedData = true;
+    try {
+        await loadAllData();
+    } finally {
+        isRefreshingSharedData = false;
+    }
+}
+
+function startSharedDataSync() {
+    if (sharedSyncTimer) return;
+
+    // Refresh every 8 seconds so changes made on another device appear automatically.
+    sharedSyncTimer = setInterval(() => {
+        if (document.visibilityState === "visible") {
+            refreshSharedData();
+        }
+    }, 8000);
+
+    window.addEventListener("focus", refreshSharedData);
+    document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "visible") {
+            refreshSharedData();
+        }
+    });
+}
+
 document.addEventListener("DOMContentLoaded", async () => {
     setupRoleButtons();
     setupNavigation();
@@ -277,7 +425,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     updateTodayDate();
 
     // Load the shared list before showing the member login dropdown.
-    await loadMembers();
+    await loadAllData();
 
     if (currentUser) {
         startApp();
@@ -427,6 +575,7 @@ function startApp() {
     populateAssignee();
     populateMeetingSelects();
     renderAll();
+    startSharedDataSync();
 }
 
 
@@ -1407,6 +1556,9 @@ function populateMeetingSelects() {
     }
 
 
+    const previousAttendanceMeeting = attendanceSelect.value;
+    const previousMomMeeting = momSelect.value;
+
     attendanceSelect.innerHTML =
         `<option value="">Select meeting</option>`;
 
@@ -1444,6 +1596,14 @@ function populateMeetingSelects() {
         momSelect.appendChild(option2);
 
     });
+
+    if (meetings.some(meeting => meeting.meetingId === previousAttendanceMeeting)) {
+        attendanceSelect.value = previousAttendanceMeeting;
+    }
+
+    if (meetings.some(meeting => meeting.meetingId === previousMomMeeting)) {
+        momSelect.value = previousMomMeeting;
+    }
 }
 
 
@@ -2252,6 +2412,11 @@ function setupForms() {
 
 
 function logout() {
+
+    if (sharedSyncTimer) {
+        clearInterval(sharedSyncTimer);
+        sharedSyncTimer = null;
+    }
 
     localStorage.removeItem("teamTrackUser");
 
