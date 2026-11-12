@@ -189,26 +189,95 @@ function showToast(message) {
 }
 
 
-function sendToSheet(payload) {
+// Send an action to Google Apps Script.
+// text/plain keeps the request a simple cross-origin request (no JSON preflight).
+async function sendToSheet(payload) {
+    try {
+        const response = await fetch(SCRIPT_URL, {
+            method: "POST",
+            headers: {
+                "Content-Type": "text/plain;charset=utf-8"
+            },
+            body: JSON.stringify(payload),
+            redirect: "follow"
+        });
 
-    fetch(SCRIPT_URL, {
-        method: "POST",
-        body: JSON.stringify(payload)
-    })
-    .catch(error => {
-        console.error("Google Sheet error:", error);
-    });
+        if (!response.ok) {
+            throw new Error(`Google Apps Script returned ${response.status}`);
+        }
+
+        // Some Apps Script deployments do not expose a readable response body.
+        // The write may still have reached the script, so callers also refresh data.
+        try {
+            return await response.json();
+        } catch (_) {
+            return { success: true };
+        }
+    } catch (error) {
+        console.error("Google Sheet write error:", error);
+        showToast("Could not confirm the Google Sheets update. Please refresh and check.");
+        return { success: false, error: error.message };
+    }
 }
 
 
+// Fetch the shared member list from the Google Sheet.
+// Expected Apps Script response: { success: true, members: ["Name", ...] }
+async function loadMembers() {
+    try {
+        const url = `${SCRIPT_URL}?action=getMembers&_=${Date.now()}`;
+        const response = await fetch(url, {
+            method: "GET",
+            cache: "no-store",
+            redirect: "follow"
+        });
 
-document.addEventListener("DOMContentLoaded", () => {
+        if (!response.ok) {
+            throw new Error(`Google Apps Script returned ${response.status}`);
+        }
 
+        const data = await response.json();
+        const receivedMembers = Array.isArray(data)
+            ? data
+            : (data.members || data.data || []);
+
+        if (!Array.isArray(receivedMembers)) {
+            throw new Error("The getMembers response does not contain a members array.");
+        }
+
+        teamMembers = [...new Set(
+            receivedMembers
+                .map(member => typeof member === "string" ? member : member.name)
+                .filter(member => typeof member === "string" && member.trim())
+                .map(member => member.trim())
+        )];
+
+        saveMembers();
+        populateMemberLogin();
+
+        if (currentUser) {
+            populateAssignee();
+            renderTeamSetup();
+        }
+
+        return true;
+    } catch (error) {
+        console.error("Could not load members from Google Sheets:", error);
+        // Keep the last locally cached list available if the sheet cannot be reached.
+        populateMemberLogin();
+        return false;
+    }
+}
+
+
+document.addEventListener("DOMContentLoaded", async () => {
     setupRoleButtons();
     setupNavigation();
     setupForms();
-    populateMemberLogin();
     updateTodayDate();
+
+    // Load the shared list before showing the member login dropdown.
+    await loadMembers();
 
     if (currentUser) {
         startApp();
@@ -269,67 +338,48 @@ function setupRoleButtons() {
 
 document
     .getElementById("loginForm")
-    .addEventListener("submit", function(event) {
-
+    .addEventListener("submit", async function(event) {
         event.preventDefault();
 
         let name = "";
 
         if (selectedRole === "leader") {
-
-            name = document
-                .getElementById("leaderName")
-                .value
-                .trim();
-
+            name = document.getElementById("leaderName").value.trim();
             if (!name) {
                 showToast("Please enter your name.");
                 return;
             }
-
         } else {
-
-            name = document
-                .getElementById("memberName")
-                .value;
-
+            name = document.getElementById("memberName").value;
             if (!name) {
                 showToast("Please select your name.");
                 return;
             }
         }
 
+        currentUser = { name, role: selectedRole };
+        localStorage.setItem("teamTrackUser", JSON.stringify(currentUser));
 
-        currentUser = {
-            name: name,
-            role: selectedRole
-        };
+        if (currentUser.role === "leader") {
+            const leaderAlreadyExists = teamMembers.some(
+                member => member.toLowerCase() === currentUser.name.toLowerCase()
+            );
 
-        localStorage.setItem(
-            "teamTrackUser",
-            JSON.stringify(currentUser)
-        );
+            if (!leaderAlreadyExists) {
+                const result = await sendToSheet({
+                    action: "addMember",
+                    name: currentUser.name,
+                    addedBy: currentUser.name
+                });
 
-
-
-        if (
-            currentUser.role === "leader" &&
-            !teamMembers.some(
-                member =>
-                    member.toLowerCase() === currentUser.name.toLowerCase()
-            )
-        ) {
-
-            teamMembers.push(currentUser.name);
-            saveMembers();
-
-            sendToSheet({
-                action: "addMember",
-                name: currentUser.name,
-                addedBy: currentUser.name
-            });
+                // Update the local view immediately; then reconcile with the sheet.
+                teamMembers.push(currentUser.name);
+                saveMembers();
+                if (result.success !== false) {
+                    await loadMembers();
+                }
+            }
         }
-
 
         startApp();
     });
@@ -460,20 +510,18 @@ function populateMemberLogin() {
     const message =
         document.getElementById("noMembersMessage");
 
+    if (!select) return;
 
     select.innerHTML =
         `<option value="">Select member</option>`;
 
 
     if (teamMembers.length === 0) {
-
-        message.classList.remove("hidden");
-
+        if (message) message.classList.remove("hidden");
         return;
     }
 
-
-    message.classList.add("hidden");
+    if (message) message.classList.add("hidden");
 
 
     teamMembers.forEach(member => {
@@ -588,8 +636,7 @@ function renderTeamSetup() {
 }
 
 
-function addMember(name) {
-
+async function addMember(name) {
     name = name.trim();
 
     if (!name) {
@@ -597,83 +644,74 @@ function addMember(name) {
         return;
     }
 
-
-    const exists =
-        teamMembers.some(
-            member =>
-                member.toLowerCase() === name.toLowerCase()
-        );
-
+    const exists = teamMembers.some(
+        member => member.toLowerCase() === name.toLowerCase()
+    );
 
     if (exists) {
         showToast("This member is already added.");
         return;
     }
 
-
-    teamMembers.push(name);
-
-    saveMembers();
-
-    sendToSheet({
+    const result = await sendToSheet({
         action: "addMember",
-        name: name,
-        addedBy: currentUser.name
+        name,
+        addedBy: currentUser ? currentUser.name : "Leader"
     });
 
+    if (result.success === false) {
+        showToast("Member could not be confirmed in Google Sheets.");
+        return;
+    }
+
+    // Refresh from the sheet so all users see the same source of truth.
+    const loaded = await loadMembers();
+    if (!loaded && !teamMembers.some(member => member.toLowerCase() === name.toLowerCase())) {
+        teamMembers.push(name);
+        saveMembers();
+    }
 
     populateMemberLogin();
     populateAssignee();
-
     renderTeamSetup();
-
     showToast("Team member added.");
 }
 
 
-function removeMember(index) {
-
-    const member =
-        teamMembers[index];
-
+async function removeMember(index) {
+    const member = teamMembers[index];
     if (!member) return;
 
-
-    const hasTasks =
-        tasks.some(
-            task => task.assignedTo === member
-        );
-
-
+    const hasTasks = tasks.some(task => task.assignedTo === member);
     if (hasTasks) {
-
-        const confirmRemove =
-            confirm(
-                `${member} has assigned tasks. Remove this member anyway?`
-            );
-
-        if (!confirmRemove) {
-            return;
-        }
+        const confirmRemove = confirm(
+            `${member} has assigned tasks. Remove this member anyway?`
+        );
+        if (!confirmRemove) return;
     }
 
-
-    teamMembers.splice(index, 1);
-
-    saveMembers();
-
-    sendToSheet({
+    const result = await sendToSheet({
         action: "removeMember",
         name: member,
-        removedBy: currentUser.name
+        removedBy: currentUser ? currentUser.name : "Leader"
     });
 
+    if (result.success === false) {
+        showToast("Member could not be removed from Google Sheets.");
+        return;
+    }
+
+    const loaded = await loadMembers();
+    if (!loaded) {
+        teamMembers = teamMembers.filter(
+            existing => existing.toLowerCase() !== member.toLowerCase()
+        );
+        saveMembers();
+    }
 
     populateMemberLogin();
     populateAssignee();
-
     renderTeamSetup();
-
     showToast("Team member removed.");
 }
 
