@@ -1333,16 +1333,27 @@ function reviewCard(log) {
 
 
             ${(() => {
-                const myReview = reviews.find(
-                    item => item.reviewKey === getReviewKey(log.logId, currentUser.name)
+                // Show every reviewer's feedback on this log to the task submitter,
+                // the leader, and other team members. Do not filter by currentUser.
+                const logReviews = reviews.filter(item =>
+                    String(item.logId) === String(log.logId) &&
+                    String(item.feedback || "").trim() !== ""
                 );
-                const feedback = myReview?.feedback || "";
-                return feedback
-                    ? `<div class="review-feedback">
-                        <strong>Your Feedback:</strong>
-                        ${escapeHTML(feedback)}
-                    </div>`
-                    : "";
+
+                if (logReviews.length === 0) return "";
+
+                return `
+                    <div class="review-feedback">
+                        <strong>Team Feedback</strong>
+                        ${logReviews.map(review => `
+                            <div class="feedback-entry">
+                                <strong>${escapeHTML(review.reviewedBy || "Team member")}</strong>
+                                <p>${escapeHTML(review.feedback)}</p>
+                                <small>${formatDateTime(review.reviewedAt) || ""}</small>
+                            </div>
+                        `).join("")}
+                    </div>
+                `;
             })()}
 
 
@@ -1369,12 +1380,19 @@ function saveLocalReview(review) {
     saveReviews();
 }
 
-function updateReviewStatus(logId, status) {
-    const log = logs.find(item => item.logId === logId);
+async function updateReviewStatus(logId, status) {
+    const log = logs.find(item => String(item.logId) === String(logId));
     if (!log) return;
-    const existing = reviews.find(item => item.reviewKey === getReviewKey(logId, currentUser.name));
+
+    const reviewKey = getReviewKey(logId, currentUser.name);
+    const existing = reviews.find(item =>
+        item.reviewKey === reviewKey ||
+        (String(item.logId) === String(logId) &&
+         String(item.reviewedBy || "").toLowerCase() === currentUser.name.toLowerCase())
+    );
+
     const review = {
-        reviewId: getReviewKey(logId, currentUser.name),
+        reviewId: reviewKey,
         logId: log.logId,
         taskId: log.taskId,
         taskName: log.taskName,
@@ -1384,22 +1402,40 @@ function updateReviewStatus(logId, status) {
         feedback: existing?.feedback || "",
         reviewedAt: new Date().toISOString()
     };
+
+    const result = await sendToSheet({ action: "saveReview", ...review });
+    if (!result || result.success === false) {
+        showToast("Could not save the review. Please try again.");
+        return;
+    }
+
     saveLocalReview(review);
-    sendToSheet({ action: "saveReview", ...review });
     renderReviews();
-    showToast(`Your review is ${status}.`);
+    showToast(`Review marked ${status}.`);
 }
 
-function sendFeedback(logId) {
+async function sendFeedback(logId) {
     const feedback = prompt("Enter feedback for this submission:");
     if (feedback === null) return;
+
     const cleanFeedback = feedback.trim();
-    if (!cleanFeedback) { showToast("Feedback cannot be empty."); return; }
-    const log = logs.find(item => item.logId === logId);
+    if (!cleanFeedback) {
+        showToast("Feedback cannot be empty.");
+        return;
+    }
+
+    const log = logs.find(item => String(item.logId) === String(logId));
     if (!log) return;
-    const existing = reviews.find(item => item.reviewKey === getReviewKey(logId, currentUser.name));
+
+    const reviewKey = getReviewKey(logId, currentUser.name);
+    const existing = reviews.find(item =>
+        item.reviewKey === reviewKey ||
+        (String(item.logId) === String(logId) &&
+         String(item.reviewedBy || "").toLowerCase() === currentUser.name.toLowerCase())
+    );
+
     const review = {
-        reviewId: getReviewKey(logId, currentUser.name),
+        reviewId: reviewKey,
         logId: log.logId,
         taskId: log.taskId,
         taskName: log.taskName,
@@ -1409,10 +1445,18 @@ function sendFeedback(logId) {
         feedback: cleanFeedback,
         reviewedAt: new Date().toISOString()
     };
+
+    // Write to the shared spreadsheet first. The periodic shared-data sync will
+    // then make this feedback visible on every device.
+    const result = await sendToSheet({ action: "saveReview", ...review });
+    if (!result || result.success === false) {
+        showToast("Feedback could not be saved. Please try again.");
+        return;
+    }
+
     saveLocalReview(review);
-    sendToSheet({ action: "saveReview", ...review });
     renderReviews();
-    showToast("Your feedback was saved.");
+    showToast("Feedback saved and shared with the team.");
 }
 
 function removeTask(taskId) {
